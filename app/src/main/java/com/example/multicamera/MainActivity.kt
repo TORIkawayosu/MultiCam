@@ -1,40 +1,22 @@
 package com.example.multicamera
 
 import android.Manifest
-import android.annotation.SuppressLint
-import android.content.Context
 import android.content.pm.PackageManager
-import android.hardware.camera2.CameraCharacteristics
 import android.os.Bundle
-import android.os.Environment
-import android.util.SizeF
+import android.os.Handler
+import android.os.Looper
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.core.CameraInfo
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ConcurrentCamera
-import androidx.camera.core.Preview
-import androidx.camera.core.UseCaseGroup
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.FallbackStrategy
-import androidx.camera.video.FileOutputOptions
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
-import androidx.camera.video.Recorder
-import androidx.camera.video.Recording
-import androidx.camera.video.VideoCapture
-import androidx.camera.video.VideoRecordEvent
-import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -44,14 +26,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Mic
@@ -66,9 +51,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -76,374 +64,249 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.multicamera.ui.theme.MultiCameraTheme
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.math.atan
 
 class MainActivity : ComponentActivity() {
-    private var cameraProvider: ProcessCameraProvider? = null
-    private var cameraProviderRequested = false
-    private var usingCamera2Fallback = false
     private var permissionsGranted = false
-    private var ultraPreviewContainer: FrameLayout? = null
-    private var widePreviewContainer: FrameLayout? = null
-    private var cameraSession: CameraSession? = null
-    private var activeRecordings: ActiveRecordings? = null
-    private var camera2Recorder: Camera2DualRecorder? = null
+    private var plan: LensPlan? = null
+    private var recorder: MultiLensRecorder? = null
+    private var sdCard: SdCard? = null
+    private val previewContainers = LinkedHashMap<String, FrameLayout>()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val refreshRunnable = Runnable { refreshPreview() }
+    private val prefs by lazy { getSharedPreferences("multicam", MODE_PRIVATE) }
 
     private var uiState by mutableStateOf(MultiCamUiState())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        uiState = uiState.copy(status = getString(R.string.status_waiting_permission))
 
         setContent {
             MultiCameraTheme(dynamicColor = false) {
                 MultiCamScreen(
                     state = uiState,
                     onPermissionsChanged = ::onPermissionsChanged,
-                    onUltraPreviewReady = { container ->
-                        ultraPreviewContainer = container
-                        bindConcurrentCameras()
+                    onPreviewReady = { id, frame ->
+                        previewContainers[id] = frame
+                        scheduleRefresh()
                     },
-                    onWidePreviewReady = { container ->
-                        widePreviewContainer = container
-                        bindConcurrentCameras()
+                    onPreviewRelease = { id, frame ->
+                        if (previewContainers[id] === frame) previewContainers.remove(id)
                     },
-                    onRecordToggle = {
-                        if (uiState.isRecording) stopRecording() else startRecording()
+                    onRecordToggle = { if (uiState.isRecording) stopRecording() else startRecording() },
+                    onToggleLens = ::toggleLens,
+                    onPresetUltraTele = { selectLenses(ultraTeleSelection(plan?.lenses.orEmpty())) },
+                    onPresetAll = { selectLenses(plan?.lenses.orEmpty().map { it.physicalId }.toSet()) },
+                    onFpsChanged = { uiState = uiState.copy(videoSettings = uiState.videoSettings.copy(fps = it)) },
+                    onQualityChanged = { id, q ->
+                        val s = uiState.videoSettings
+                        uiState = uiState.copy(videoSettings = s.copy(qualities = s.qualities + (id to q)))
                     },
-                    onSettingsChanged = { settings ->
-                        uiState = uiState.copy(videoSettings = settings)
+                    onStorageChanged = ::changeStorage,
+                    onToggleDiagnostics = {
+                        uiState = uiState.copy(
+                            diagnostics = if (uiState.diagnostics == null)
+                                runCatching { LensDetector.diagnostics(this) }.getOrNull() else null
+                        )
                     }
                 )
             }
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        refreshStorage()
+    }
+
     override fun onDestroy() {
-        activeRecordings?.stopAll()
-        cameraProvider?.unbindAll()
-        camera2Recorder?.release()
+        mainHandler.removeCallbacks(refreshRunnable)
+        recorder?.release()
         super.onDestroy()
     }
+
+    // ── 権限・レンズ検出 ────────────────────────────────────────────────────
 
     private fun onPermissionsChanged(granted: Boolean) {
         permissionsGranted = granted
         uiState = uiState.copy(
             hasPermissions = granted,
-            status = if (granted) "Preparazione camere" else "Servono camera e microfono"
+            status = getString(if (granted) R.string.status_preparing else R.string.status_need_permission)
         )
-        if (granted) requestCameraProvider()
+        if (granted) setupLenses()
     }
 
-    private fun requestCameraProvider() {
-        if (cameraProviderRequested) {
-            bindConcurrentCameras()
+    private fun setupLenses() {
+        val detected = try {
+            LensDetector.detect(this)
+        } catch (t: Throwable) {
+            uiState = uiState.copy(
+                error = getString(R.string.error_detect_failed, t.localizedMessage ?: ""),
+                diagnostics = runCatching { LensDetector.diagnostics(this) }.getOrNull()
+            )
             return
         }
-        cameraProviderRequested = true
-        val future = ProcessCameraProvider.getInstance(this)
-        future.addListener(
-            {
-                runCatching {
-                    cameraProvider = future.get()
-                    bindConcurrentCameras()
-                }.onFailure { error ->
-                    uiState = uiState.copy(
-                        isCameraReady = false,
-                        status = "Camera non disponibile",
-                        error = error.localizedMessage ?: "Impossibile inizializzare CameraX"
-                    )
-                }
-            },
-            ContextCompat.getMainExecutor(this)
-        )
-    }
-
-    private fun bindConcurrentCameras() {
-        if (usingCamera2Fallback) return
-        val provider = cameraProvider ?: return
-        val ultraContainer = ultraPreviewContainer ?: return
-        val wideContainer = widePreviewContainer ?: return
-        if (!permissionsGranted || activeRecordings != null) return
-
-        runCatching {
-            provider.unbindAll()
-            val pair = chooseRearConcurrentPair(provider)
-                ?: error("Il dispositivo non espone una coppia posteriore 0.5x + 1x utilizzabile in concurrent mode.")
-
-            val ultraRecorder = Recorder.Builder().setQualitySelector(VideoQualitySelector).build()
-            val wideRecorder = Recorder.Builder().setQualitySelector(VideoQualitySelector).build()
-            val ultraVideo = VideoCapture.withOutput(ultraRecorder)
-            val wideVideo = VideoCapture.withOutput(wideRecorder)
-            val ultraView = attachCameraXPreview(ultraContainer)
-            val wideView = attachCameraXPreview(wideContainer)
-
-            val ultraPreview = Preview.Builder().build().apply { setSurfaceProvider(ultraView.surfaceProvider) }
-            val widePreview = Preview.Builder().build().apply { setSurfaceProvider(wideView.surfaceProvider) }
-
-            val ultraConfig = ConcurrentCamera.SingleCameraConfig(
-                selectorForCameraId(pair.ultra.cameraId),
-                UseCaseGroup.Builder().addUseCase(ultraPreview).addUseCase(ultraVideo).build(),
-                this
-            )
-            val wideConfig = ConcurrentCamera.SingleCameraConfig(
-                selectorForCameraId(pair.wide.cameraId),
-                UseCaseGroup.Builder().addUseCase(widePreview).addUseCase(wideVideo).build(),
-                this
-            )
-
-            provider.bindToLifecycle(listOf(ultraConfig, wideConfig))
-            cameraSession = CameraSession(ultra = BoundLens(pair.ultra, ultraVideo), wide = BoundLens(pair.wide, wideVideo))
+        if (detected == null) {
             uiState = uiState.copy(
-                isCameraReady = true,
-                status = "Pronto",
-                error = null,
-                ultraCameraLabel = "0.5x",
-                wideCameraLabel = "1x",
-                ultraCameraDetails = pair.ultra.detailLabel(),
-                wideCameraDetails = pair.wide.detailLabel()
+                error = getString(R.string.error_unsupported_device),
+                diagnostics = runCatching { LensDetector.diagnostics(this) }.getOrNull()
             )
-        }.onFailure { error ->
-            cameraSession = null
-            startCamera2Fallback(error.localizedMessage ?: "Associazione CameraX fallita")
+            return
         }
-    }
+        plan = detected
 
-    private fun attachCameraXPreview(container: FrameLayout): PreviewView {
-        container.removeAllViews()
-        return PreviewView(this).apply {
-            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
-            scaleType = PreviewView.ScaleType.FILL_CENTER
-            container.addView(this, FrameLayout.LayoutParams(-1, -1))
-        }
-    }
+        val ids = detected.lenses.map { it.physicalId }.toSet()
+        val saved = prefs.getStringSet(PREF_LENSES, null)?.filter { it in ids }?.toSet().orEmpty()
+        val selected = saved.ifEmpty { ultraTeleSelection(detected.lenses) }
 
-    private fun startCamera2Fallback(reason: String) {
-        val ultraContainer = ultraPreviewContainer ?: return
-        val wideContainer = widePreviewContainer ?: return
-        usingCamera2Fallback = true
-        cameraProvider?.unbindAll()
+        if (recorder == null) recorder = MultiLensRecorder(this, recorderCallback)
+        val noTele = detected.lenses.none { it.type == LensType.TELE }
         uiState = uiState.copy(
-            isCameraReady = false,
-            status = "Provo fallback Camera2",
-            error = "CameraX concurrent non disponibile: $reason"
+            lenses = detected.lenses,
+            selectedIds = selected,
+            error = if (noTele) getString(R.string.error_no_tele) else null,
+            diagnostics = if (noTele) runCatching { LensDetector.diagnostics(this) }.getOrNull() else null
         )
-
-        camera2Recorder?.release()
-        camera2Recorder = Camera2DualRecorder(
-            context = this,
-            ultraContainer = ultraContainer,
-            wideContainer = wideContainer,
-            callback = object : Camera2DualRecorder.Callback {
-                override fun onCamera2Ready(status: String, ultraDetails: String, wideDetails: String) {
-                    runOnUiThread {
-                        uiState = uiState.copy(
-                            isCameraReady = true,
-                            status = status,
-                            error = null,
-                            ultraCameraLabel = "0.5x",
-                            wideCameraLabel = "1x",
-                            ultraCameraDetails = ultraDetails,
-                            wideCameraDetails = wideDetails
-                        )
-                    }
-                }
-                override fun onCamera2Error(message: String, diagnostics: String) {
-                    runOnUiThread {
-                        uiState = uiState.copy(
-                            isCameraReady = false,
-                            isRecording = false,
-                            status = "Camera2 non disponibile",
-                            error = "$message\n$diagnostics"
-                        )
-                    }
-                }
-                override fun onCamera2RecordingStarted(status: String) {
-                    runOnUiThread {
-                        uiState = uiState.copy(
-                            isRecording = true,
-                            status = status,
-                            error = null,
-                            lastFiles = emptyList()
-                        )
-                    }
-                }
-                override fun onCamera2RecordingFinished(files: List<String>, message: String) {
-                    runOnUiThread {
-                        uiState = uiState.copy(
-                            isRecording = false,
-                            isCameraReady = true,
-                            status = message,
-                            error = null,
-                            lastFiles = files
-                        )
-                    }
-                }
-            }
-        ).also { it.startPreview() }
+        scheduleRefresh()
     }
+
+    /** 超広角＋望遠。どちらかが無ければ、画角の両端の2本（1本なら その1本）。 */
+    private fun ultraTeleSelection(lenses: List<LensInfo>): Set<String> {
+        val ultra = lenses.firstOrNull { it.type == LensType.ULTRA_WIDE }
+        val tele = lenses.lastOrNull { it.type == LensType.TELE }
+        return if (ultra != null && tele != null) setOf(ultra.physicalId, tele.physicalId)
+        else listOfNotNull(lenses.firstOrNull(), lenses.lastOrNull()).map { it.physicalId }.toSet()
+    }
+
+    // ── レンズ選択 ──────────────────────────────────────────────────────────
+
+    private fun toggleLens(id: String) {
+        val current = uiState.selectedIds
+        val next = if (id in current) current - id else current + id
+        if (next.isNotEmpty()) selectLenses(next)   // 最低1本は選択
+    }
+
+    private fun selectLenses(ids: Set<String>) {
+        if (uiState.isRecording || ids.isEmpty() || ids == uiState.selectedIds) return
+        uiState = uiState.copy(selectedIds = ids)
+        prefs.edit().putStringSet(PREF_LENSES, ids).apply()
+        scheduleRefresh()
+    }
+
+    /** プレビュー用の View が揃うのを待ってから、まとめて1回だけ再構築する。 */
+    private fun scheduleRefresh() {
+        mainHandler.removeCallbacks(refreshRunnable)
+        mainHandler.postDelayed(refreshRunnable, 60)
+    }
+
+    private fun refreshPreview() {
+        if (!permissionsGranted || uiState.isRecording) return
+        val p = plan ?: return
+        val rec = recorder ?: return
+        val selected = p.lenses.filter { it.physicalId in uiState.selectedIds }
+        if (selected.isEmpty() || selected.any { previewContainers[it.physicalId] == null }) return
+        uiState = uiState.copy(isCameraReady = false, status = getString(R.string.status_preparing))
+        rec.startPreview(p, selected, previewContainers.toMap())
+    }
+
+    // ── 保存先 ──────────────────────────────────────────────────────────────
+
+    private fun refreshStorage() {
+        sdCard = StorageHelper.findSdCard(this)
+        val wanted = when (prefs.getString(PREF_STORAGE, null)) {
+            StorageChoice.INTERNAL.name -> StorageChoice.INTERNAL
+            else -> StorageChoice.SD            // 未設定ならSDカード優先
+        }
+        if (uiState.isRecording) {
+            uiState = uiState.copy(sdName = sdCard?.description)
+            return
+        }
+        uiState = uiState.copy(
+            sdName = sdCard?.description,
+            storage = if (wanted == StorageChoice.SD && sdCard != null) StorageChoice.SD else StorageChoice.INTERNAL
+        )
+    }
+
+    private fun changeStorage(choice: StorageChoice) {
+        if (uiState.isRecording) return
+        if (choice == StorageChoice.SD && sdCard == null) return
+        prefs.edit().putString(PREF_STORAGE, choice.name).apply()
+        uiState = uiState.copy(storage = choice)
+    }
+
+    // ── 録画 ────────────────────────────────────────────────────────────────
 
     private fun startRecording() {
-        if (usingCamera2Fallback) {
-            if (!permissionsGranted) return
-            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            camera2Recorder?.startRecording(recordingDirectory(), timestamp, uiState.videoSettings)
-            return
+        if (!permissionsGranted) return
+        val target = when (uiState.storage) {
+            StorageChoice.SD -> {
+                val sd = StorageHelper.findSdCard(this)
+                sdCard = sd
+                if (sd == null) {
+                    uiState = uiState.copy(sdName = null, error = getString(R.string.error_sd_missing))
+                    return
+                }
+                StorageHelper.sdTarget(this, sd)
+            }
+            StorageChoice.INTERNAL -> StorageHelper.internalTarget(this)
         }
-        startCameraXRecording()
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        recorder?.startRecording(target, timestamp, uiState.videoSettings)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun startCameraXRecording() {
-        val session = cameraSession ?: return
-        if (!permissionsGranted || activeRecordings != null) return
+    private fun stopRecording() {
+        uiState = uiState.copy(status = getString(R.string.status_saving))
+        recorder?.stopRecording()
+    }
 
-        val outputDir = recordingDirectory()
-        outputDir.mkdirs()
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val ultraFile = File(outputDir, "MultiCam_${timestamp}_0_5x.mp4")
-        val wideFile = File(outputDir, "MultiCam_${timestamp}_1x.mp4")
-
-        runCatching {
-            val ultraRecording = session.ultra.videoCapture.output
-                .prepareRecording(this, FileOutputOptions.Builder(ultraFile).build())
-                .withAudioEnabled()
-                .start(ContextCompat.getMainExecutor(this)) { event -> onVideoEvent("0.5x", ultraFile, event) }
-
-            val wideRecording = session.wide.videoCapture.output
-                .prepareRecording(this, FileOutputOptions.Builder(wideFile).build())
-                .withAudioEnabled()
-                .start(ContextCompat.getMainExecutor(this)) { event -> onVideoEvent("1x", wideFile, event) }
-
-            activeRecordings = ActiveRecordings(ultra = ultraRecording, wide = wideRecording, files = listOf(ultraFile, wideFile))
-            uiState = uiState.copy(isRecording = true, status = "Registrazione in corso", error = null, lastFiles = emptyList())
-        }.onFailure { error ->
-            activeRecordings?.stopAll()
-            activeRecordings = null
+    private val recorderCallback = object : MultiLensRecorder.Callback {
+        override fun onReady(lensCount: Int) = runOnUiThread {
             uiState = uiState.copy(
-                isRecording = false,
-                status = "Registrazione non avviata",
-                error = error.localizedMessage ?: "Errore durante l'avvio della registrazione"
+                isCameraReady = true,
+                status = getString(R.string.status_ready, lensCount),
+                error = null
             )
         }
-    }
 
-    @SuppressLint("MissingPermission")
-    private fun stopRecording() {
-        if (usingCamera2Fallback) {
-            uiState = uiState.copy(status = "Salvataggio video")
-            camera2Recorder?.stopRecording()
-            return
+        override fun onError(message: String, diagnostics: String) = runOnUiThread {
+            uiState = uiState.copy(
+                isCameraReady = false,
+                isRecording = false,
+                status = message,
+                error = "$message\n$diagnostics"
+            )
         }
-        val recordings = activeRecordings ?: return
-        uiState = uiState.copy(status = "Salvataggio video")
-        recordings.stopAll()
-    }
 
-    private fun onVideoEvent(label: String, file: File, event: VideoRecordEvent) {
-        when (event) {
-            is VideoRecordEvent.Start -> {
-                uiState = uiState.copy(status = "Registrazione $label avviata")
-            }
-            is VideoRecordEvent.Finalize -> {
-                val recordings = activeRecordings
-                recordings?.finalizedLabels?.add(label)
-                val nextError = if (event.hasError()) {
-                    "$label: ${event.cause?.localizedMessage ?: "registrazione interrotta"}"
-                } else {
-                    uiState.error
-                }
-                if (recordings == null || recordings.finalizedLabels.size >= 2) {
-                    activeRecordings = null
-                    bindConcurrentCameras()
-                    val exportedFiles = recordings?.files
-                        ?.takeIf { nextError == null }
-                        ?.let { MediaStoreVideoExporter.export(this, it) }
-                        .orEmpty()
-                    uiState = uiState.copy(
-                        isRecording = false,
-                        status = if (nextError == null) "Video salvati in Movies/MultiCam" else "Registrazione completata con errori",
-                        error = nextError,
-                        lastFiles = exportedFiles.ifEmpty {
-                            recordings?.files?.map { it.absolutePath } ?: listOf(file.absolutePath)
-                        }
-                    )
-                } else if (nextError != null) {
-                    uiState = uiState.copy(error = nextError)
-                }
-            }
-            else -> Unit
+        override fun onRecordingStarted(summary: String) = runOnUiThread {
+            uiState = uiState.copy(
+                isRecording = true,
+                status = getString(R.string.status_recording, summary),
+                error = null,
+                lastFiles = emptyList()
+            )
         }
-    }
 
-    private fun recordingDirectory(): File {
-        val moviesDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
-        return File(moviesDir, "MultiCam")
-    }
-
-    private fun chooseRearConcurrentPair(provider: ProcessCameraProvider): RearLensPair? {
-        return provider.availableConcurrentCameraInfos
-            .asSequence()
-            .mapNotNull { infos ->
-                val rearInfos = infos
-                    .filter { it.lensFacing() == CameraCharacteristics.LENS_FACING_BACK }
-                    .map { it.toLensDescriptor() }
-                    .sortedByDescending { it.horizontalFovDegrees }
-                if (rearInfos.size >= 2) {
-                    RearLensPair(
-                        ultra = rearInfos[0],
-                        wide = rearInfos[1],
-                        fovGap = rearInfos[0].horizontalFovDegrees - rearInfos[1].horizontalFovDegrees
-                    )
-                } else null
-            }
-            .maxWithOrNull(compareBy<RearLensPair> { it.fovGap }.thenBy { it.ultra.horizontalFovDegrees })
-    }
-
-    private fun selectorForCameraId(cameraId: String): CameraSelector {
-        return CameraSelector.Builder()
-            .addCameraFilter { cameraInfos ->
-                cameraInfos.filter { Camera2CameraInfo.from(it).cameraId == cameraId }
-            }
-            .build()
-    }
-
-    private fun CameraInfo.toLensDescriptor(): LensDescriptor {
-        val camera2Info = Camera2CameraInfo.from(this)
-        val focalLengths = camera2Info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-        val sensorSize = camera2Info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
-        val minFocalLength = focalLengths?.minOrNull()
-        return LensDescriptor(
-            cameraId = camera2Info.cameraId,
-            focalLengthMm = minFocalLength,
-            horizontalFovDegrees = horizontalFov(sensorSize, minFocalLength)
-        )
-    }
-
-    private fun CameraInfo.lensFacing(): Int? {
-        return Camera2CameraInfo.from(this).getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
-    }
-
-    private fun horizontalFov(sensorSize: SizeF?, focalLengthMm: Float?): Float {
-        if (sensorSize == null || focalLengthMm == null || focalLengthMm <= 0f) return 0f
-        return Math.toDegrees(2.0 * atan(sensorSize.width.toDouble() / (2.0 * focalLengthMm))).toFloat()
+        override fun onRecordingFinished(files: List<String>, message: String) = runOnUiThread {
+            uiState = uiState.copy(isRecording = false, status = message, error = null, lastFiles = files)
+            refreshStorage()
+        }
     }
 
     private companion object {
-        val VideoQualitySelector: QualitySelector = QualitySelector.fromOrderedList(
-            listOf(Quality.FHD, Quality.HD, Quality.SD),
-            FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
-        )
+        const val PREF_LENSES = "selected_lenses"
+        const val PREF_STORAGE = "storage"
     }
 }
 
@@ -453,45 +316,19 @@ private data class MultiCamUiState(
     val hasPermissions: Boolean = false,
     val isCameraReady: Boolean = false,
     val isRecording: Boolean = false,
-    val status: String = "In attesa dei permessi",
+    val status: String = "",
     val error: String? = null,
-    val ultraCameraLabel: String = "0.5x",
-    val wideCameraLabel: String = "1x",
-    val ultraCameraDetails: String = "Ultra-wide",
-    val wideCameraDetails: String = "Wide",
+    val lenses: List<LensInfo> = emptyList(),
+    val selectedIds: Set<String> = emptySet(),
+    val storage: StorageChoice = StorageChoice.INTERNAL,
+    val sdName: String? = null,
+    val diagnostics: String? = null,
     val lastFiles: List<String> = emptyList(),
-    val videoSettings: DualVideoSettings = DualVideoSettings()
+    val videoSettings: VideoSettings = VideoSettings()
 )
 
-// ── Camera descriptors ────────────────────────────────────────────────────────
-
-private data class LensDescriptor(
-    val cameraId: String,
-    val focalLengthMm: Float?,
-    val horizontalFovDegrees: Float
-) {
-    fun detailLabel(): String {
-        val focal = focalLengthMm?.let { "%.1f mm".format(Locale.US, it) } ?: "focale n/d"
-        val fov = if (horizontalFovDegrees > 0f) {
-            "%.0f deg".format(Locale.US, horizontalFovDegrees)
-        } else {
-            "FOV n/d"
-        }
-        return "ID $cameraId - $focal - $fov"
-    }
-}
-
-private data class RearLensPair(val ultra: LensDescriptor, val wide: LensDescriptor, val fovGap: Float)
-private data class BoundLens(val descriptor: LensDescriptor, val videoCapture: VideoCapture<Recorder>)
-private data class CameraSession(val ultra: BoundLens, val wide: BoundLens)
-private data class ActiveRecordings(
-    val ultra: Recording,
-    val wide: Recording,
-    val files: List<File>,
-    val finalizedLabels: MutableSet<String> = linkedSetOf()
-) {
-    fun stopAll() { ultra.stop(); wide.stop() }
-}
+private val LensColors = listOf(Color(0xFFBFE7FF), Color(0xFF8EE7B5), Color(0xFFFFD27F), Color(0xFFE3B8FF), Color(0xFFFFB3A9))
+private fun lensColor(index: Int) = LensColors[index % LensColors.size]
 
 // ── Composables ───────────────────────────────────────────────────────────────
 
@@ -499,10 +336,16 @@ private data class ActiveRecordings(
 private fun MultiCamScreen(
     state: MultiCamUiState,
     onPermissionsChanged: (Boolean) -> Unit,
-    onUltraPreviewReady: (FrameLayout) -> Unit,
-    onWidePreviewReady: (FrameLayout) -> Unit,
+    onPreviewReady: (String, FrameLayout) -> Unit,
+    onPreviewRelease: (String, FrameLayout?) -> Unit,
     onRecordToggle: () -> Unit,
-    onSettingsChanged: (DualVideoSettings) -> Unit
+    onToggleLens: (String) -> Unit,
+    onPresetUltraTele: () -> Unit,
+    onPresetAll: () -> Unit,
+    onFpsChanged: (FpsPreference) -> Unit,
+    onQualityChanged: (String, QualityPreference) -> Unit,
+    onStorageChanged: (StorageChoice) -> Unit,
+    onToggleDiagnostics: () -> Unit
 ) {
     val context = LocalContext.current
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -531,21 +374,23 @@ private fun MultiCamScreen(
                 .navigationBarsPadding()
                 .padding(16.dp)
         ) {
-            Column(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
+            Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Header(state)
                 PreviewLayout(
                     state = state,
                     modifier = Modifier.fillMaxWidth().weight(1f),
-                    onUltraPreviewReady = onUltraPreviewReady,
-                    onWidePreviewReady = onWidePreviewReady
+                    onPreviewReady = onPreviewReady,
+                    onPreviewRelease = onPreviewRelease
                 )
                 SettingsPanel(
-                    settings = state.videoSettings,
-                    enabled = !state.isRecording,
-                    onSettingsChanged = onSettingsChanged
+                    state = state,
+                    onToggleLens = onToggleLens,
+                    onPresetUltraTele = onPresetUltraTele,
+                    onPresetAll = onPresetAll,
+                    onFpsChanged = onFpsChanged,
+                    onQualityChanged = onQualityChanged,
+                    onStorageChanged = onStorageChanged,
+                    onToggleDiagnostics = onToggleDiagnostics
                 )
                 ControlDock(state = state, onRecordToggle = onRecordToggle)
             }
@@ -562,7 +407,7 @@ private fun Header(state: MultiCamUiState) {
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "MultiCam",
+                text = stringResource(R.string.app_name),
                 color = Color.White,
                 style = MaterialTheme.typography.headlineMedium,
                 fontWeight = FontWeight.Bold,
@@ -578,7 +423,9 @@ private fun Header(state: MultiCamUiState) {
             )
         }
         StatusPill(
-            text = if (state.isRecording) "REC" else if (state.isCameraReady) "READY" else "WAIT",
+            text = stringResource(
+                if (state.isRecording) R.string.pill_rec else if (state.isCameraReady) R.string.pill_ready else R.string.pill_wait
+            ),
             color = if (state.isRecording) Color(0xFFE94141) else if (state.isCameraReady) Color(0xFF35D07F) else Color(0xFFFFC857)
         )
     }
@@ -588,40 +435,42 @@ private fun Header(state: MultiCamUiState) {
 private fun PreviewLayout(
     state: MultiCamUiState,
     modifier: Modifier = Modifier,
-    onUltraPreviewReady: (FrameLayout) -> Unit,
-    onWidePreviewReady: (FrameLayout) -> Unit
+    onPreviewReady: (String, FrameLayout) -> Unit,
+    onPreviewRelease: (String, FrameLayout?) -> Unit
 ) {
+    val selected = state.lenses.filter { it.physicalId in state.selectedIds }
+
     BoxWithConstraints(modifier = modifier) {
         val horizontal = maxWidth > maxHeight
         if (horizontal) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                PreviewTile(
-                    title = state.ultraCameraLabel, subtitle = state.ultraCameraDetails,
-                    recording = state.isRecording,
-                    modifier = Modifier.weight(1f).fillMaxHeight(),
-                    onPreviewReady = onUltraPreviewReady
-                )
-                PreviewTile(
-                    title = state.wideCameraLabel, subtitle = state.wideCameraDetails,
-                    recording = state.isRecording,
-                    modifier = Modifier.weight(1f).fillMaxHeight(),
-                    onPreviewReady = onWidePreviewReady
-                )
+                selected.forEach { lens ->
+                    key(lens.physicalId) {
+                        PreviewTile(
+                            lens = lens,
+                            color = lensColor(state.lenses.indexOf(lens)),
+                            recording = state.isRecording,
+                            modifier = Modifier.weight(1f).fillMaxHeight(),
+                            onPreviewReady = onPreviewReady,
+                            onPreviewRelease = onPreviewRelease
+                        )
+                    }
+                }
             }
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                PreviewTile(
-                    title = state.ultraCameraLabel, subtitle = state.ultraCameraDetails,
-                    recording = state.isRecording,
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                    onPreviewReady = onUltraPreviewReady
-                )
-                PreviewTile(
-                    title = state.wideCameraLabel, subtitle = state.wideCameraDetails,
-                    recording = state.isRecording,
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                    onPreviewReady = onWidePreviewReady
-                )
+                selected.forEach { lens ->
+                    key(lens.physicalId) {
+                        PreviewTile(
+                            lens = lens,
+                            color = lensColor(state.lenses.indexOf(lens)),
+                            recording = state.isRecording,
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                            onPreviewReady = onPreviewReady,
+                            onPreviewRelease = onPreviewRelease
+                        )
+                    }
+                }
             }
         }
     }
@@ -629,12 +478,18 @@ private fun PreviewLayout(
 
 @Composable
 private fun PreviewTile(
-    title: String,
-    subtitle: String,
+    lens: LensInfo,
+    color: Color,
     recording: Boolean,
     modifier: Modifier = Modifier,
-    onPreviewReady: (FrameLayout) -> Unit
+    onPreviewReady: (String, FrameLayout) -> Unit,
+    onPreviewRelease: (String, FrameLayout?) -> Unit
 ) {
+    val frameHolder = remember { arrayOfNulls<FrameLayout>(1) }
+    DisposableEffect(lens.physicalId) {
+        onDispose { onPreviewRelease(lens.physicalId, frameHolder[0]) }
+    }
+
     Card(
         modifier = modifier,
         shape = RoundedCornerShape(8.dp),
@@ -647,11 +502,12 @@ private fun PreviewTile(
                 factory = { ctx ->
                     FrameLayout(ctx).also { frame ->
                         frame.layoutParams = android.view.ViewGroup.LayoutParams(-1, -1)
-                        onPreviewReady(frame)
+                        frameHolder[0] = frame
+                        onPreviewReady(lens.physicalId, frame)
                     }
                 }
             )
-            // Label overlay
+            // レンズ名
             Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -661,28 +517,19 @@ private fun PreviewTile(
                     .padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Filled.Videocam,
-                    contentDescription = null,
-                    tint = Color(0xFFBFE7FF),
-                    modifier = Modifier.size(18.dp)
-                )
+                Icon(Icons.Filled.Videocam, contentDescription = null, tint = color, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
                 Column {
-                    Text(text = title, color = Color.White, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                    Text(text = subtitle, color = Color(0xFFC9D3D8), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(lens.label, color = Color.White, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(lens.detail, color = Color(0xFFC9D3D8), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
-            // REC badge
             if (recording) {
                 StatusPill(
-                    text = "REC",
+                    text = stringResource(R.string.pill_rec),
                     color = Color(0xFFE94141),
                     modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
                 )
-            }
-            // "Preview off during REC" overlay
-            if (recording) {
                 Box(
                     modifier = Modifier
                         .align(Alignment.Center)
@@ -692,10 +539,10 @@ private fun PreviewTile(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = "Preview disabilitata\ndurante la registrazione",
+                        text = stringResource(R.string.preview_disabled),
                         color = Color(0xFFB7C3C9),
                         style = MaterialTheme.typography.bodySmall,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        textAlign = TextAlign.Center
                     )
                 }
             }
@@ -703,129 +550,165 @@ private fun PreviewTile(
     }
 }
 
-// ── Settings panel ────────────────────────────────────────────────────────────
+// ── 設定パネル ────────────────────────────────────────────────────────────────
 
 @Composable
 private fun SettingsPanel(
-    settings: DualVideoSettings,
-    enabled: Boolean,
-    onSettingsChanged: (DualVideoSettings) -> Unit
+    state: MultiCamUiState,
+    onToggleLens: (String) -> Unit,
+    onPresetUltraTele: () -> Unit,
+    onPresetAll: () -> Unit,
+    onFpsChanged: (FpsPreference) -> Unit,
+    onQualityChanged: (String, QualityPreference) -> Unit,
+    onStorageChanged: (StorageChoice) -> Unit,
+    onToggleDiagnostics: () -> Unit
 ) {
+    val enabled = !state.isRecording
+    val hasUltra = state.lenses.any { it.type == LensType.ULTRA_WIDE }
+    val hasTele = state.lenses.any { it.type == LensType.TELE }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF161B1F)),
         border = BorderStroke(1.dp, Color(0xFF2C343A))
     ) {
-        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            // 0.5x row
+        Column(
+            modifier = Modifier
+                .heightIn(max = 230.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // レンズ選択
+            SectionTitle(stringResource(R.string.lens_select_title))
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text(
-                    text = "0.5x",
-                    color = Color(0xFFBFE7FF),
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.width(38.dp)
+                state.lenses.forEachIndexed { index, lens ->
+                    Chip(
+                        text = lens.label,
+                        active = lens.physicalId in state.selectedIds,
+                        accent = lensColor(index),
+                        enabled = enabled
+                    ) { onToggleLens(lens.physicalId) }
+                }
+                Spacer(Modifier.width(6.dp))
+                Chip(
+                    text = stringResource(R.string.preset_ultra_tele),
+                    active = false,
+                    accent = Color(0xFFFFD27F),
+                    enabled = enabled && hasUltra && hasTele,
+                    onClick = onPresetUltraTele
                 )
-                QualitySelector(
-                    selected = settings.ultraQuality,
+                Chip(
+                    text = stringResource(R.string.preset_all),
+                    active = state.lenses.isNotEmpty() && state.selectedIds.size == state.lenses.size,
+                    accent = Color(0xFFFFD27F),
                     enabled = enabled,
-                    modifier = Modifier.weight(1f)
-                ) { q -> onSettingsChanged(settings.copy(ultraQuality = q)) }
-                Spacer(Modifier.width(4.dp))
-                FpsSelector(
-                    selected = settings.ultraFps,
-                    enabled = enabled
-                ) { f -> onSettingsChanged(settings.copy(ultraFps = f)) }
+                    onClick = onPresetAll
+                )
+                Chip(
+                    text = "診断",
+                    active = state.diagnostics != null,
+                    accent = Color(0xFFB7C3C9),
+                    enabled = true,
+                    onClick = onToggleDiagnostics
+                )
             }
-            // 1x row
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = "1x",
-                    color = Color(0xFF8EE7B5),
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.width(38.dp)
-                )
-                QualitySelector(
-                    selected = settings.wideQuality,
-                    enabled = enabled,
-                    modifier = Modifier.weight(1f)
-                ) { q -> onSettingsChanged(settings.copy(wideQuality = q)) }
-                Spacer(Modifier.width(4.dp))
-                FpsSelector(
-                    selected = settings.wideFps,
+
+            // 保存先
+            SectionTitle(stringResource(R.string.storage_title))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Chip(
+                    text = stringResource(R.string.storage_internal),
+                    active = state.storage == StorageChoice.INTERNAL,
+                    accent = Color(0xFF35D07F),
                     enabled = enabled
-                ) { f -> onSettingsChanged(settings.copy(wideFps = f)) }
+                ) { onStorageChanged(StorageChoice.INTERNAL) }
+                Chip(
+                    text = if (state.sdName != null) stringResource(R.string.storage_sd) else stringResource(R.string.storage_sd_missing),
+                    active = state.storage == StorageChoice.SD,
+                    accent = Color(0xFF35D07F),
+                    enabled = enabled && state.sdName != null
+                ) { onStorageChanged(StorageChoice.SD) }
+            }
+
+            // フレームレート
+            SectionTitle(stringResource(R.string.fps_title))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FpsPreference.entries.forEach { f ->
+                    Chip(
+                        text = "${f.value}fps",
+                        active = f == state.videoSettings.fps,
+                        accent = Color(0xFF69C8FF),
+                        enabled = enabled
+                    ) { onFpsChanged(f) }
+                }
+            }
+
+            // レンズごとの画質
+            state.lenses.forEachIndexed { index, lens ->
+                if (lens.physicalId !in state.selectedIds) return@forEachIndexed
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = lens.label,
+                        color = lensColor(index),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.width(92.dp),
+                        maxLines = 2
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        QualityPreference.entries.forEach { q ->
+                            Chip(
+                                text = stringResource(q.labelRes),
+                                active = q == state.videoSettings.qualityFor(lens.physicalId),
+                                accent = Color(0xFF35D07F),
+                                enabled = enabled
+                            ) { onQualityChanged(lens.physicalId, q) }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun QualitySelector(
-    selected: QualityPreference,
-    enabled: Boolean,
-    modifier: Modifier = Modifier,
-    onSelect: (QualityPreference) -> Unit
-) {
-    Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        QualityPreference.entries.forEach { q ->
-            val active = q == selected
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (active) Color(0xFF35D07F).copy(alpha = 0.18f) else Color(0xFF1E262B))
-                    .border(1.dp, if (active) Color(0xFF35D07F) else Color(0xFF2C343A), RoundedCornerShape(6.dp))
-                    .clickable(enabled = enabled) { onSelect(q) }
-                    .padding(horizontal = 8.dp, vertical = 5.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = q.label,
-                    color = if (active) Color(0xFF35D07F) else if (enabled) Color(0xFFB7C3C9) else Color(0xFF4A5560),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = if (active) FontWeight.Bold else FontWeight.Normal
-                )
-            }
-        }
-    }
+private fun SectionTitle(text: String) {
+    Text(text, color = Color(0xFF8FA0A8), style = MaterialTheme.typography.labelMedium)
 }
 
 @Composable
-private fun FpsSelector(
-    selected: FpsPreference,
+private fun Chip(
+    text: String,
+    active: Boolean,
+    accent: Color,
     enabled: Boolean,
-    onSelect: (FpsPreference) -> Unit
+    onClick: () -> Unit
 ) {
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        FpsPreference.entries.forEach { f ->
-            val active = f == selected
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (active) Color(0xFF69C8FF).copy(alpha = 0.18f) else Color(0xFF1E262B))
-                    .border(1.dp, if (active) Color(0xFF69C8FF) else Color(0xFF2C343A), RoundedCornerShape(6.dp))
-                    .clickable(enabled = enabled) { onSelect(f) }
-                    .padding(horizontal = 8.dp, vertical = 5.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "${f.value}fps",
-                    color = if (active) Color(0xFF69C8FF) else if (enabled) Color(0xFFB7C3C9) else Color(0xFF4A5560),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = if (active) FontWeight.Bold else FontWeight.Normal
-                )
-            }
-        }
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (active) accent.copy(alpha = 0.18f) else Color(0xFF1E262B))
+            .border(1.dp, if (active) accent else Color(0xFF2C343A), RoundedCornerShape(6.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 9.dp, vertical = 6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            color = if (active) accent else if (enabled) Color(0xFFB7C3C9) else Color(0xFF4A5560),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+            maxLines = 1
+        )
     }
 }
 
@@ -848,8 +731,14 @@ private fun ControlDock(state: MultiCamUiState, onRecordToggle: () -> Unit) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.weight(1f)
                 ) {
-                    Icon(imageVector = Icons.Filled.Mic, contentDescription = null, tint = Color(0xFF8EE7B5), modifier = Modifier.size(20.dp))
-                    Text(text = "Audio su entrambi i file", color = Color(0xFFEAF1F4), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Icon(Icons.Filled.Mic, contentDescription = null, tint = Color(0xFF8EE7B5), modifier = Modifier.size(20.dp))
+                    Text(
+                        text = stringResource(R.string.audio_note),
+                        color = Color(0xFFEAF1F4),
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
                 Button(
                     enabled = state.hasPermissions && state.isCameraReady,
@@ -865,20 +754,37 @@ private fun ControlDock(state: MultiCamUiState, onRecordToggle: () -> Unit) {
                 ) {
                     Icon(
                         imageVector = if (state.isRecording) Icons.Filled.Stop else Icons.Filled.FiberManualRecord,
-                        contentDescription = if (state.isRecording) "Stop" else "Record",
+                        contentDescription = stringResource(if (state.isRecording) R.string.cd_stop else R.string.cd_record),
                         modifier = Modifier.size(30.dp)
                     )
                 }
             }
 
             AnimatedVisibility(visible = state.error != null) {
-                Text(text = state.error.orEmpty(), color = Color(0xFFFFB3A9), style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                Text(
+                    text = state.error.orEmpty(),
+                    color = Color(0xFFFFB3A9),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            if (state.diagnostics != null) {
+                SelectionContainer {
+                    Text(
+                        text = state.diagnostics,
+                        color = Color(0xFFC9D3D8),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.heightIn(max = 130.dp).verticalScroll(rememberScrollState())
+                    )
+                }
             }
 
             AnimatedVisibility(visible = state.lastFiles.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     state.lastFiles.forEach { path ->
-                        Text(text = path, color = Color(0xFFB7C3C9), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(path, color = Color(0xFFB7C3C9), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
             }

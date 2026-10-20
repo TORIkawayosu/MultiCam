@@ -1,158 +1,75 @@
-<div align="center">
+# 📷 MultiCam（マルチレンズ版・日本語）
 
-<img src="https://img.shields.io/badge/Android-3DDC84?style=for-the-badge&logo=android&logoColor=white"/>
-<img src="https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white"/>
-<img src="https://img.shields.io/badge/Camera2_API-FF6F00?style=for-the-badge&logo=google&logoColor=white"/>
-<img src="https://img.shields.io/badge/Jetpack_Compose-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white"/>
+Android の背面レンズを **好きな組み合わせで同時録画** するアプリです。
+元プロジェクト [RuggeroCadamuroITA/MultiCam](https://github.com/RuggeroCadamuroITA/MultiCam)（MIT）をフォークして改造したものです。
 
-# 📷 MultiCam
+## 元のアプリからの変更点
 
-**Simultaneous dual-camera recording for Android.**  
-Two lenses. One tap. Zero compromises.
+| | 元 | この版 |
+|---|---|---|
+| レンズ | 超広角 + 広角 の2本固定 | 検出した背面レンズから **自由に選択**（超広角 / 広角 / 望遠 / 全て） |
+| プリセット | なし | 「超広角＋望遠」「全て」ボタン |
+| 保存先 | 本体の Movies/MultiCam | **SDカード** または 本体を選択（SDカードがあれば既定でSD） |
+| 画質 | レンズごとに設定 | 同じ（選択中の各レンズごと）。既定は 1080p |
+| fps | レンズごと | 全レンズ共通（1つの撮影リクエストで動かすため） |
+| 言語 | イタリア語/英語 | 日本語 |
+| 動作方式 | CameraX 同時カメラ → Camera2 | Camera2 の物理カメラ指定のみ |
 
-</div>
+## 改変について
 
----
+この版は、Anthropic の AI「Claude」の支援を受けて改変しました。
 
-## What it does
+- 動作確認は **Xperia 1 II** のみです（それも、すべての機能を確認したわけではありません）。他の機種では未確認です。
+- Xperia 1 II では、超広角が別のカメラIDで公開されており、**超広角と望遠の同時録画はできません**（端末が別IDのカメラの同時使用を許可しないため）。広角＋望遠は同時に録画できます。
+- 同じ論理カメラに超広角・広角・望遠がすべて入っている機種では、3本とも同時に選べる可能性があります。
+- 動作の保証はありません。自己責任でお使いください。
 
-MultiCam records from **two rear cameras at the same time** — ultra-wide (0.5×) and main (1×) — each to its own MP4 file, both with audio, with independently configurable quality and framerate.
+## 使い方
 
-No stitching. No switching. Two separate video files, ready to edit.
+1. 起動してカメラ・マイクの権限を許可します。
+2. 「撮影するレンズ」で撮りたいレンズをタップ（複数選択可）。最低1本は選択されます。
+3. 「保存先」で SDカード / 本体 を選びます。
+4. 画質・fps を選んで ⏺ を押すと、選んだレンズぶんのMP4が **レンズごとに別ファイル** で保存されます。
 
----
-
-## How it works
-
-Android doesn't make this easy. MultiCam tries two strategies in order:
-
-```
-┌─────────────────────────────────────────────────────┐
-│  1. CameraX Concurrent Camera API                   │
-│     → cleanest path, works if the device exposes    │
-│       a concurrent-capable rear pair                │
-└────────────────────┬────────────────────────────────┘
-                     │ fails (most devices, incl. Pixel 7a)
-                     ▼
-┌─────────────────────────────────────────────────────┐
-│  2. Camera2 Physical Camera fallback                │
-│     → opens the logical rear camera, binds two      │
-│       physical sensor IDs via OutputConfiguration   │
-│       .setPhysicalCameraId()                        │
-│     → recording session uses ONLY recorder surfaces │
-│       (no preview streams) for maximum encoder      │
-│       headroom                                      │
-└─────────────────────────────────────────────────────┘
-```
-
-Audio is captured **once** (from the 0.5× stream) and muxed into both output files via `MediaExtractor` + `MediaMuxer` after recording stops — no double microphone opening, no sync issues.
-
----
-
-## Features
-
-| | |
-|---|---|
-| 🎬 | Simultaneous dual-camera recording |
-| 🎙️ | Audio on both output files |
-| ⚙️ | Per-camera quality selector — Max / 4K / 1080p / 720p |
-| 🎞️ | Per-camera FPS selector — 30 / 60 fps |
-| 🚫 | Preview disabled during recording (frees encoder headroom) |
-| 📁 | Auto-export to `Movies/MultiCam` via MediaStore |
-| 🔁 | Automatic CameraX → Camera2 fallback |
-| 📊 | Live camera diagnostics if hardware blocks dual streaming |
-| 🌑 | Dark UI built with Jetpack Compose |
-
----
-
-## Screenshots
-
-> *Two preview tiles side by side. Tap record. Both cameras roll.*
+保存例（`SDカード/Movies/MultiCam/`）:
 
 ```
-┌──────────────────────────────────────────┐
-│  MultiCam                      ● READY   │
-│  Fallback Camera2 pronto                 │
-├───────────────────┬──────────────────────┤
-│  📷 0.5x          │  📷 1x               │
-│  physical ID 2    │  physical ID 3       │
-│                   │                      │
-│   [live preview]  │   [live preview]     │
-│                   │                      │
-├───────────────────┴──────────────────────┤
-│  0.5x  [Max] [4K] [1080p] [720p]  [30fps] [60fps] │
-│   1x   [Max] [4K] [1080p] [720p]  [30fps] [60fps] │
-├──────────────────────────────────────────┤
-│  🎙 Audio on both files          [ ⏺ ]  │
-└──────────────────────────────────────────┘
+MultiCam_20261020_072400_ultrawide_0_6x.mp4   ← 超広角（音声あり）
+MultiCam_20261020_072400_tele_5x.mp4          ← 望遠（音声を複製）
 ```
 
----
+## SDカード保存のしくみ
 
-## Requirements
+- 録画中は、SDカード上のアプリ専用フォルダ（`Android/data/…/files/Movies/MultiCam`）へ直接書き込みます。
+- 停止後、同じSDカードの公開フォルダ `Movies/MultiCam` にMediaStore経由でコピーし、ギャラリー等から見えるようにします。コピーに成功したファイルは、重複を避けるため専用フォルダから削除します。
+- 権限の追加は不要です。SDカードが外れていると録画を開始せずエラーを表示します。
 
-- Android **9.0+** (API 28) — required for `setPhysicalCameraId()`
-- A device with a **logical multi-camera** rear group (two or more physical sensors behind one logical ID)
-- `CAMERA` + `RECORD_AUDIO` permissions
+## レンズの分類
 
-> Tested on **Pixel 7a** — CameraX concurrent not available, Camera2 physical fallback active.
+論理マルチカメラの物理カメラ ID を列挙し、35mm換算焦点距離から分類します。
+メイン（換算 約20〜40mm で最大画素数）を 1x として、0.75倍未満を超広角、1.5倍超を望遠とします。
 
----
+## 動作要件
 
-## Output files
+- Android **10（API 29）以上**
+- 背面に **論理マルチカメラ**（物理センサー2つ以上）を持つ端末
+- `CAMERA` / `RECORD_AUDIO` 権限
 
-After each recording session, two files are saved to:
+## 既知の制限
 
-```
-/sdcard/Movies/MultiCam/
-├── MultiCam_20250606_143021_0_5x.mp4   ← ultra-wide + audio
-└── MultiCam_20250606_143021_1x.mp4     ← main + audio (muxed)
-```
+- 同時に動かせるレンズ数・解像度は端末依存です。「全て」や4Kの組み合わせは拒否されることがあり、その場合はエラー表示が出ます。レンズ数を減らすか画質・fps を下げてください。
+- 録画中はエンコーダの余裕を確保するためプレビューを停止します。
+- 音声は先頭（最も広角）のレンズのファイルに録音し、他のファイルへ録画後に複製します。
+- マクロ等の補助レンズが物理カメラとして見える端末では、それも選択肢に出ます。
 
-Files are immediately visible in Google Photos / Files app.
-
----
-
-## Build
+## ビルド
 
 ```bash
-git clone https://github.com/RuggeroCadamuroITA/MultiCam
-cd MultiCam
 ./gradlew assembleDebug
-```
-
-Install:
-```bash
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
----
+## ライセンス
 
-## Stack
-
-- **Jetpack Compose** — UI
-- **CameraX** — concurrent camera (primary path)
-- **Camera2 API** — physical camera fallback, recorder sessions
-- **MediaRecorder** — H264 encoding per physical sensor
-- **MediaMuxer / MediaExtractor** — post-recording audio mux
-- **MediaStore** — public export to Movies/
-
----
-
-## Known limitations
-
-- Preview is frozen during recording by design — encoder headroom
-- If the device doesn't expose physical camera IDs on the rear logical camera, dual recording is not possible via public APIs
-- 4K simultaneous on both streams may cause frame drops depending on device thermals and encoder availability
-
----
-
-## License
-
-MIT
-
----
-
-<div align="center">
-  <sub>Built for Pixel 7a · Camera2 physical camera API · Jetpack Compose</sub>
-</div>
+MIT。`LICENSE` を参照してください。元プロジェクトの作者（RuggeroCadamuroITA）の著作権表示を残しています。
+なお、元リポジトリには LICENSE ファイルがなく、README に「MIT」と書かれているのみでした。
