@@ -15,6 +15,13 @@ enum class FpsPreference(val value: Int) {
     FPS_60(60)
 }
 
+/** 音声をどのファイルに録音するか。 */
+enum class AudioPreference(@StringRes val labelRes: Int) {
+    ALL(R.string.audio_all),
+    FIRST_ONLY(R.string.audio_first),
+    OFF(R.string.audio_off)
+}
+
 /** 保存先の選択。 */
 enum class StorageChoice { INTERNAL, SD }
 
@@ -24,6 +31,7 @@ enum class StorageChoice { INTERNAL, SD }
  */
 data class VideoSettings(
     val fps: FpsPreference = FpsPreference.FPS_60,
+    val audio: AudioPreference = AudioPreference.ALL,
     val qualities: Map<String, QualityPreference> = emptyMap()
 ) {
     fun qualityFor(physicalId: String): QualityPreference =
@@ -49,7 +57,11 @@ data class LensInfo(
     val detail: String,       // 例: 「ID 2 ・ 焦点 2.2 mm …」
     val fileTag: String,      // ファイル名用。例: ultrawide_0_6x
     val videoSizes: List<Size>,
-    val previewSize: Size
+    val previewSize: Size,
+    /** プレビューに使える出力サイズの一覧（録画の縦横比に合わせて選ぶ）。 */
+    val previewSizes: List<Size>,
+    /** センサーの向き（度）。プレビューと録画の回転補正に使う。 */
+    val sensorOrientation: Int
 )
 
 data class LensPlan(

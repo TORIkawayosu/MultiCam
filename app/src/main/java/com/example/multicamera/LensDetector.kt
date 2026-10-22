@@ -25,35 +25,40 @@ object LensDetector {
         val pixelArea: Long,
         val videoSizes: List<Size>,
         val previewSize: Size,
+        val previewSizes: List<Size>,
         val cameraId: String,
-        val isPhysicalStream: Boolean
+        val isPhysicalStream: Boolean,
+        val sensorOrientation: Int
     )
 
     fun detect(context: Context): LensPlan? {
         val manager = context.getSystemService(CameraManager::class.java)
 
+        // 背面の論理マルチカメラ（無い端末もある）
         val logical = manager.cameraIdList.mapNotNull { id ->
             val chars = manager.getCameraCharacteristics(id)
             val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toSet().orEmpty()
             val back = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
             val multi = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)
             if (back && multi && chars.physicalCameraIds.size >= 2) id to chars else null
-        }.maxByOrNull { it.second.physicalCameraIds.size } ?: return null
+        }.maxByOrNull { it.second.physicalCameraIds.size }
 
-        val physicalIds = logical.second.physicalCameraIds
-        val physical = physicalIds.mapNotNull { describe(manager, it, logical.first, true, allowFallback = true) }
-        if (physical.isEmpty()) return null
+        val physicalIds = logical?.second?.physicalCameraIds.orEmpty()
+        val physical = if (logical != null) {
+            physicalIds.mapNotNull { describe(manager, it, logical.first, true, allowFallback = true) }
+        } else emptyList()
 
-        // 論理カメラに含まれない背面カメラ（例: 超広角が別IDで公開されている端末）も、単独のカメラとして追加する。
+        // 論理カメラに含まれない背面カメラ（別IDで公開されているレンズ）は、単独のカメラとして追加する。
         val standalone = manager.cameraIdList.filter { id ->
-            if (id == logical.first || id in physicalIds) return@filter false
+            if (logical != null && (id == logical.first || id in physicalIds)) return@filter false
             val c = manager.getCameraCharacteristics(id)
             val caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toSet().orEmpty()
             c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
                 !caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)
         }.mapNotNull { describe(manager, it, it, false, allowFallback = false) }
+
         val raws = physical + standalone
-        if (raws.size < 2) return null
+        if (raws.isEmpty()) return null
 
         // メイン（広角）レンズ：換算20〜40mmのうち画素数が最大のもの。なければ26mmに最も近いもの。
         val main = raws.filter { it.equivMm in 20f..40f }.maxByOrNull { it.pixelArea }
@@ -92,10 +97,12 @@ object LensDetector {
                 ),
                 fileTag = tag,
                 videoSizes = raw.videoSizes,
-                previewSize = raw.previewSize
+                previewSize = raw.previewSize,
+                previewSizes = raw.previewSizes,
+                sensorOrientation = raw.sensorOrientation
             )
         }
-        return LensPlan(logical.first, lenses)
+        return LensPlan(logical?.first ?: raws.first().cameraId, lenses)
     }
 
     private fun describe(
@@ -135,7 +142,9 @@ object LensDetector {
         val pixels = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
             ?.let { it.width.toLong() * it.height.toLong() } ?: 0L
 
-        return Raw(id, focal, equiv, fov, pixels, videoSizes, previewSize, cameraId, isPhysicalStream)
+        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+
+        return Raw(id, focal, equiv, fov, pixels, videoSizes, previewSize, previewCandidates.toList(), cameraId, isPhysicalStream, sensorOrientation)
     }
 
     /** 1倍未満は0.1刻み、1倍以上は0.5刻みに丸めて表示する。 */

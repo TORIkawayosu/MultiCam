@@ -8,9 +8,8 @@ import android.provider.MediaStore
 import java.io.File
 import java.util.Locale
 
-/** 録画の一時保存先（dir）と、最終的に公開する MediaStore のボリューム。 */
+/** 録画の保存先。MediaStore のボリューム（本体 / SDカード）の Movies/MultiCam に、直接書き込む。 */
 data class SaveTarget(
-    val dir: File,
     val mediaStoreVolume: String,
     val label: String
 )
@@ -41,17 +40,12 @@ object StorageHelper {
         return null
     }
 
-    fun internalTarget(context: Context): SaveTarget {
-        val movies = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir
-        return SaveTarget(
-            dir = File(movies, "MultiCam"),
-            mediaStoreVolume = MediaStore.VOLUME_EXTERNAL_PRIMARY,
-            label = context.getString(R.string.label_internal_storage)
-        )
-    }
+    fun internalTarget(context: Context) = SaveTarget(
+        mediaStoreVolume = MediaStore.VOLUME_EXTERNAL_PRIMARY,
+        label = context.getString(R.string.label_internal_storage)
+    )
 
     fun sdTarget(context: Context, sd: SdCard) = SaveTarget(
-        dir = File(sd.dir, "MultiCam"),
         mediaStoreVolume = sd.mediaStoreVolume,
         label = context.getString(R.string.label_sd_card)
     )

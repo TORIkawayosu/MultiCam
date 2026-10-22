@@ -32,6 +32,11 @@
     <string name="quality_fhd">1080p</string>
     <string name="quality_hd">720p</string>
 
+    <string name="audio_title">音声の録音</string>
+    <string name="audio_all">全ファイル</string>
+    <string name="audio_first">1本のみ</string>
+    <string name="audio_off">なし</string>
+
     <!-- 画面 -->
     <string name="audio_note">音声はすべてのファイルに収録されます</string>
     <string name="preview_disabled">録画中はプレビューを\n停止しています</string>
@@ -39,7 +44,7 @@
     <string name="cd_record">録画</string>
 
     <!-- 保存結果 -->
-    <string name="saved_to">保存しました：%1$s の Movies/MultiCam</string>
+    <string name="saved_to">保存しました：%1$s の Movies/MultiCam（録画しながら直接書き込み）</string>
     <string name="saved_audio_mux_failed">保存しました（一部、音声の複製に失敗：%1$s）</string>
     <string name="saved_partial">一部のみ保存できました。残りはアプリ専用領域に残っています</string>
     <string name="saved_app_only">公開フォルダへのコピーに失敗したため、アプリ専用領域に保存しました</string>
@@ -47,12 +52,14 @@
     <string name="label_sd_card">SDカード</string>
 
     <!-- エラー -->
-    <string name="error_unsupported_device">この端末では、背面の複数レンズ（物理カメラ）を同時に扱えません。</string>
+    <string name="error_unsupported_device">背面カメラを検出できませんでした。下の一覧は、この端末がアプリに公開しているカメラです。</string>
     <string name="error_detect_failed">レンズの検出に失敗しました：%1$s</string>
     <string name="error_sd_missing">SDカードが見つかりません。挿入するか、保存先を「本体」に切り替えてください。</string>
     <string name="error_no_tele">望遠レンズを検出できませんでした。下の一覧は、この端末がアプリに公開しているカメラです。</string>
     <string name="error_multi_device">別々のカメラIDのレンズ（例: 超広角と望遠）を同時に開けませんでした（エラー %1$s）。この端末が同時使用を許可していない可能性があります。広角＋望遠、のように同じカメラ内のレンズだけを選んでください。</string>
     <string name="error_multi_device_rejected">別々のカメラIDのレンズを組み合わせたセッションを端末が拒否しました。同時使用が許可されていない可能性があります。レンズの組み合わせか画質を変えてください。</string>
+    <string name="error_save_failed">動画を保存できませんでした。</string>
+    <string name="hint_audio">複数ファイルへの同時音声録音を端末が拒否した可能性があります。「音声の録音」を「1本のみ」か「なし」にしてください。</string>
     <string name="error_not_ready">カメラの準備ができていません。</string>
     <string name="error_android_version">Android 10 以上が必要です。</string>
     <string name="error_no_profile">選択した画質に対応する録画サイズがありません。</string>

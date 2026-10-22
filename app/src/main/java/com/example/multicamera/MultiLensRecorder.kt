@@ -2,6 +2,7 @@ package com.example.multicamera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -10,10 +11,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.media.MediaMuxer
+import android.hardware.display.DisplayManager
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
@@ -23,10 +21,10 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.core.content.ContextCompat
-import java.io.File
-import java.nio.ByteBuffer
+import kotlin.math.min
 
 /**
  * 背面レンズを任意の組み合わせで同時にプレビュー／録画する。各レンズは別々のMP4になる。
@@ -35,7 +33,7 @@ import java.nio.ByteBuffer
  * - 論理カメラに含まれないレンズ（例: 別IDの超広角）は、別のカメラとして追加で開く。
  *   この「複数カメラの同時オープン」を許すかは端末次第で、拒否された場合はエラーを返す。
  *
- * 音声は先頭のレンズのファイルに録音し、録画後に他のファイルへ複製（mux）する。
+ * 録画は MediaStore（本体 / SDカード）の Movies/MultiCam へ直接書き込む。録画後のコピーや再変換はしない。
  * カメラ関連の状態は、すべてメインスレッドで扱う。
  */
 class MultiLensRecorder(
@@ -56,260 +54,358 @@ class MultiLensRecorder(
 
     private val devices = LinkedHashMap<String, CameraDevice>()
     private val sessions = LinkedHashMap<String, CameraCaptureSession>()
+    private val pendingOpens = HashMap<String, MutableList<(CameraDevice?, String?) -> Unit>>()
 
-    private var plan: LensPlan? = null
     private var selected: List<LensInfo> = emptyList()
     private val textures = LinkedHashMap<String, TextureView>()
 
     @Volatile private var activeRecording: ActiveRecording? = null
     private var previewGeneration = 0
     private var sessionToken = 0
-    private var opening = false
-    private var reopenRequested = false
+    private var previewRetries = 0
+    private var displayListener: DisplayManager.DisplayListener? = null
+    private val previewSizeById = HashMap<String, Size>()
 
     // ── プレビュー ─────────────────────────────────────────────────────────
 
-    /** 選択中のレンズだけでプレビューを（再）構築する。録画中は無視。 */
-    fun startPreview(plan: LensPlan, selected: List<LensInfo>, containers: Map<String, FrameLayout>) {
+    /**
+     * 選択中のレンズだけでプレビューを（再）構築する。録画中は無視。
+     * プレビューの縦横比は、録画される映像（選んだ画質のサイズ）に合わせる。
+     */
+    fun startPreview(selected: List<LensInfo>, containers: Map<String, FrameLayout>, settings: VideoSettings) {
         runOnMain {
             if (activeRecording != null) return@runOnMain
-            val generation = ++previewGeneration
-            this.plan = plan
+            previewSizeById.clear()
+            selected.forEach { lens ->
+                val recording = buildProfile(lens, settings.qualityFor(lens.physicalId), settings.fps)?.size
+                previewSizeById[lens.physicalId] = choosePreviewSize(lens, recording)
+            }
+            val gate = Gate(++previewGeneration)
             this.selected = selected
             textures.clear()
+            registerDisplayListener()
 
-            val listener = PreviewReadyListener(generation)
             selected.forEach { lens ->
                 val container = containers[lens.physicalId] ?: return@forEach
                 container.removeAllViews()
                 val view = TextureView(context)
-                view.surfaceTextureListener = listener
+                view.surfaceTextureListener = PreviewListener(gate, lens)
                 container.addView(view, FrameLayout.LayoutParams(-1, -1))
                 textures[lens.physicalId] = view
             }
-            listener.check()
+            checkReady(gate)
         }
     }
 
-    private inner class PreviewReadyListener(private val generation: Int) : TextureView.SurfaceTextureListener {
-        private var fired = false
+    private class Gate(val generation: Int) {
+        var fired = false
+    }
 
-        fun check() {
-            if (fired || generation != previewGeneration) return
-            if (textures.isNotEmpty() && textures.values.all { it.isAvailable }) {
-                fired = true
-                openPreview()
-            }
+    private fun checkReady(gate: Gate) {
+        if (gate.fired || gate.generation != previewGeneration) return
+        if (textures.isNotEmpty() && textures.values.all { it.isAvailable }) {
+            gate.fired = true
+            previewRetries = 0
+            runPreviewSession()
+        }
+    }
+
+    private inner class PreviewListener(private val gate: Gate, private val lens: LensInfo) :
+        TextureView.SurfaceTextureListener {
+        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+            textures[lens.physicalId]?.let { applyTransform(lens, it, width, height) }
+            checkReady(gate)
         }
 
-        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) = check()
-        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
+        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+            textures[lens.physicalId]?.let { applyTransform(lens, it, width, height) }
+        }
+
         override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
         override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
     }
 
+    // ── 画面の向きに合わせたプレビューの回転 ────────────────────────────────
+
+    @Suppress("DEPRECATION")
+    private fun displayDegrees(): Int {
+        val wm = context.getSystemService(WindowManager::class.java)
+        return when (wm.defaultDisplay.rotation) {
+            android.view.Surface.ROTATION_90 -> 90
+            android.view.Surface.ROTATION_180 -> 180
+            android.view.Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+    }
+
+    /** 背面カメラの映像を、現在の画面の向きで正立させるのに必要な回転（時計回り・度）。 */
+    private fun relativeRotation(lens: LensInfo): Int =
+        (lens.sensorOrientation - displayDegrees() + 360) % 360
+
+    /**
+     * プレビューの補正。
+     *
+     * Camera2 は、プレビュー用の面（SurfaceTexture）に対して、映像を「端末の自然な向き（縦持ち）」で
+     * 正立するように自動で回す。そのため、センサーの向きによる回転は、アプリでは不要で、
+     * 「画面が自然な向きから、どれだけ回っているか」だけを打ち消せばよい。
+     * ただし TextureView は、その映像を、ビューいっぱいに引き伸ばして表示する。
+     * そこで、(1) 引き伸ばしを戻し、(2) 画面の回転を打ち消し、(3) 縦横比を保って枠に収める。
+     * （録画用の面は自動回転されないので、録画は別に、センサーの向きで補正する。）
+     */
+    private fun applyTransform(lens: LensInfo, view: TextureView, viewW: Int = view.width, viewH: Int = view.height) {
+        if (viewW <= 0 || viewH <= 0) return
+        val vw = viewW.toFloat()
+        val vh = viewH.toFloat()
+
+        // 自然な向きで正立した映像の縦横（センサーが90/270度なら、バッファの縦横を入れ替える）
+        val bw = previewSizeOf(lens).width.toFloat()
+        val bh = previewSizeOf(lens).height.toFloat()
+        val naturalSideways = lens.sensorOrientation % 180 != 0
+        val cw = if (naturalSideways) bh else bw
+        val ch = if (naturalSideways) bw else bh
+
+        val rotation = (360 - displayDegrees()) % 360       // 画面の回転を打ち消す（時計回り・度）
+        val swap = rotation % 180 != 0
+        val rotatedW = if (swap) ch else cw
+        val rotatedH = if (swap) cw else ch
+        val scale = min(vw / rotatedW, vh / rotatedH)
+
+        val matrix = Matrix().apply {
+            postScale(cw / vw, ch / vh)                  // ビュー座標 → 映像の座標（引き伸ばしを戻す）
+            postTranslate(-cw / 2f, -ch / 2f)
+            postRotate(rotation.toFloat())
+            postScale(scale, scale)
+            postTranslate(vw / 2f, vh / 2f)
+        }
+        view.setTransform(matrix)
+    }
+
+    private fun applyAllTransforms() {
+        selected.forEach { lens -> textures[lens.physicalId]?.let { applyTransform(lens, it) } }
+    }
+
+    /** 画面が回転したとき（横→逆向きの横など、サイズが変わらない場合も含む）に、プレビューの回転を更新する。 */
+    private fun registerDisplayListener() {
+        if (displayListener != null) return
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) = Unit
+            override fun onDisplayRemoved(displayId: Int) = Unit
+            override fun onDisplayChanged(displayId: Int) = applyAllTransforms()
+        }
+        displayListener = listener
+        context.getSystemService(DisplayManager::class.java).registerDisplayListener(listener, mainHandler)
+    }
+
+    private fun previewSizeOf(lens: LensInfo): Size = previewSizeById[lens.physicalId] ?: lens.previewSize
+
+    /** 録画サイズと同じ縦横比で、1280x960 以内でいちばん大きいプレビューサイズを選ぶ。 */
+    private fun choosePreviewSize(lens: LensInfo, recording: Size?): Size {
+        if (recording == null) return lens.previewSize
+        val target = recording.width.toFloat() / recording.height
+        fun area(s: Size) = s.width.toLong() * s.height.toLong()
+        fun diff(s: Size) = kotlin.math.abs(s.width.toFloat() / s.height - target)
+        val sameAspect = lens.previewSizes.filter { diff(it) < 0.02f }
+        val limit = 1280L * 960L
+        return sameAspect.filter { area(it) <= limit }.maxByOrNull { area(it) }
+            ?: sameAspect.minByOrNull { area(it) }
+            ?: lens.previewSizes.filter { area(it) <= limit }.minByOrNull { diff(it) }
+            ?: lens.previewSize
+    }
+
     private fun neededCameraIds(): List<String> = selected.map { it.cameraId }.distinct()
-
-    private fun openPreview() {
-        if (opening) {              // 前回のオープン処理が終わるまで待つ
-            reopenRequested = true
-            return
-        }
-        val ids = neededCameraIds()
-
-        // もう使わないカメラは閉じる
-        devices.keys.filter { it !in ids }.forEach { closeDevice(it) }
-
-        val missing = ids.filter { it !in devices }
-        if (missing.isEmpty()) {
-            runPreviewSession()
-            return
-        }
-        opening = true
-        openSequentially(missing, 0, multi = ids.size > 1) { ok ->
-            opening = false
-            if (reopenRequested) {
-                reopenRequested = false
-                openPreview()
-            } else if (ok) {
-                runPreviewSession()
-            }
-        }
-    }
-
-    /** 安全のため、カメラは1台ずつ順番に開く。 */
-    @SuppressLint("MissingPermission")
-    private fun openSequentially(ids: List<String>, index: Int, multi: Boolean, done: (Boolean) -> Unit) {
-        if (index >= ids.size) {
-            done(true)
-            return
-        }
-        val id = ids[index]
-        var finished = false
-        try {
-            cameraManager.openCamera(
-                id,
-                object : CameraDevice.StateCallback() {
-                    override fun onOpened(camera: CameraDevice) {
-                        devices[id] = camera
-                        if (!finished) {
-                            finished = true
-                            openSequentially(ids, index + 1, multi, done)
-                        }
-                    }
-
-                    override fun onDisconnected(camera: CameraDevice) {
-                        camera.close()
-                        devices.remove(id)
-                        sessions.remove(id)
-                        if (!finished) {
-                            finished = true
-                            fail(context.getString(R.string.error_camera_disconnected), done)
-                        } else {
-                            callback.onError(context.getString(R.string.error_camera_disconnected), cameraDiagnostics())
-                        }
-                    }
-
-                    override fun onError(camera: CameraDevice, error: Int) {
-                        camera.close()
-                        devices.remove(id)
-                        sessions.remove(id)
-                        val msg = if (multi) context.getString(R.string.error_multi_device, "$id:$error")
-                        else context.getString(R.string.error_camera_open, error)
-                        if (!finished) {
-                            finished = true
-                            fail(msg, done)
-                        } else {
-                            callback.onError(msg, cameraDiagnostics())
-                        }
-                    }
-                },
-                mainHandler
-            )
-        } catch (t: Throwable) {
-            val msg = if (multi) context.getString(R.string.error_multi_device, "$id:${t.message}")
-            else context.getString(R.string.error_camera_open, -1)
-            fail(msg, done)
-        }
-    }
-
-    private fun fail(message: String, done: (Boolean) -> Unit) {
-        callback.onError(message, cameraDiagnostics())
-        done(false)
-    }
-
-    private fun closeDevice(id: String) {
-        sessions.remove(id)?.let { runCatching { it.close() } }
-        devices.remove(id)?.let { runCatching { it.close() } }
-    }
 
     private fun runPreviewSession() {
         val lenses = selected
         if (lenses.isEmpty() || lenses.any { textures[it.physicalId]?.surfaceTexture == null }) return
 
+        // もう使わないカメラは閉じる
+        val needed = neededCameraIds()
+        devices.keys.filter { it !in needed }.forEach { closeDevice(it) }
+
         val surfaces = HashMap<String, Surface>()
         lenses.forEach { lens ->
             val texture = textures.getValue(lens.physicalId).surfaceTexture!!
-            texture.setDefaultBufferSize(lens.previewSize.width, lens.previewSize.height)
+            texture.setDefaultBufferSize(previewSizeOf(lens).width, previewSizeOf(lens).height)
             surfaces[lens.physicalId] = Surface(texture)
         }
         val token = ++sessionToken
-        configureSessions(
+        bringUp(
             lenses = lenses,
             template = CameraDevice.TEMPLATE_PREVIEW,
             surfaceFor = { surfaces.getValue(it.physicalId) },
             fps = null,
             token = token,
-            onAllConfigured = { callback.onReady(lenses.size) },
-            onFailed = {
-                callback.onError(
-                    context.getString(
-                        if (neededCameraIds().size > 1) R.string.error_multi_device_rejected else R.string.error_preview_rejected
-                    ),
-                    cameraDiagnostics()
-                )
+            onAllConfigured = {
+                previewRetries = 0
+                callback.onReady(lenses.size)
+            },
+            onFailed = { message ->
+                if (previewRetries < 1) {
+                    // 起動直後の一時的な失敗に備えて、1回だけ自動で再試行する
+                    previewRetries++
+                    mainHandler.postDelayed({
+                        if (activeRecording == null && token == sessionToken) runPreviewSession()
+                    }, 500)
+                } else {
+                    previewRetries = 0
+                    callback.onError(
+                        message ?: context.getString(
+                            if (needed.size > 1) R.string.error_multi_device_rejected else R.string.error_preview_rejected
+                        ),
+                        cameraDiagnostics()
+                    )
+                }
             }
         )
     }
 
     /**
-     * レンズをカメラごとにまとめ、カメラごとに1セッションを作る。
-     * すべて構成できたら、全セッションの繰り返しリクエストを開始して onAllConfigured を呼ぶ。
+     * レンズをカメラごとにまとめ、カメラを1台ずつ「開く → セッションを作る → 動かす」の順に立ち上げる。
+     * （2台目を開く前に、1台目を動かしておく。端末によっては、同時の立ち上げに失敗するため。）
+     * 全部できたら onAllConfigured、失敗したら onFailed（メッセージ、無ければ null）を呼ぶ。
+     * token が古くなったら、その時点で処理を打ち切る。
      */
-    private fun configureSessions(
+    private fun bringUp(
         lenses: List<LensInfo>,
         template: Int,
         surfaceFor: (LensInfo) -> Surface,
         fps: Int?,
         token: Int,
         onAllConfigured: () -> Unit,
-        onFailed: () -> Unit
+        onFailed: (String?) -> Unit
     ) {
-        val groups = lenses.groupBy { it.cameraId }
-        var remaining = groups.size
-        var failed = false
-        val ready = ArrayList<Pair<CameraCaptureSession, CaptureRequest>>()
+        val groups = lenses.groupBy { it.cameraId }.entries.toList()
+        val multi = groups.size > 1
 
-        groups.forEach { (cameraId, group) ->
-            val camera = devices[cameraId]
-            if (camera == null) {
-                if (!failed) { failed = true; onFailed() }
+        fun step(i: Int) {
+            if (token != sessionToken) return
+            if (i >= groups.size) {
+                onAllConfigured()
                 return
             }
-            try {
-                val surfaces = group.map(surfaceFor)
-                val outputs = group.mapIndexed { i, lens ->
-                    OutputConfiguration(surfaces[i]).apply {
-                        if (lens.isPhysicalStream) setPhysicalCameraId(lens.physicalId)
-                    }
+            val cameraId = groups[i].key
+            val group = groups[i].value
+            ensureOpen(cameraId, multi) { camera, error ->
+                if (token != sessionToken) return@ensureOpen
+                if (camera == null) {
+                    onFailed(error)
+                    return@ensureOpen
                 }
-                val request = camera.createCaptureRequest(template).apply {
-                    surfaces.forEach { addTarget(it) }
-                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-                    if (fps != null) chooseFpsRange(cameraId, fps)?.let {
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+                try {
+                    val surfaces = group.map(surfaceFor)
+                    val outputs = group.mapIndexed { index, lens ->
+                        OutputConfiguration(surfaces[index]).apply {
+                            if (lens.isPhysicalStream) setPhysicalCameraId(lens.physicalId)
+                        }
                     }
-                }.build()
+                    val request = camera.createCaptureRequest(template).apply {
+                        surfaces.forEach { addTarget(it) }
+                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        if (fps != null) chooseFpsRange(cameraId, fps)?.let {
+                            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+                        }
+                    }.build()
 
-                camera.createCaptureSession(
-                    SessionConfiguration(
-                        SessionConfiguration.SESSION_REGULAR,
-                        outputs,
-                        ContextCompat.getMainExecutor(context),
-                        object : CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(session: CameraCaptureSession) {
-                                if (token != sessionToken || failed) {
-                                    session.close()
-                                    return
-                                }
-                                sessions[cameraId] = session
-                                ready += session to request
-                                if (--remaining == 0) {
-                                    try {
-                                        ready.forEach { (s, r) -> s.setRepeatingRequest(r, null, mainHandler) }
-                                    } catch (t: Throwable) {
-                                        failed = true
-                                        onFailed()
+                    camera.createCaptureSession(
+                        SessionConfiguration(
+                            SessionConfiguration.SESSION_REGULAR,
+                            outputs,
+                            ContextCompat.getMainExecutor(context),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(session: CameraCaptureSession) {
+                                    if (token != sessionToken) {
+                                        session.close()
                                         return
                                     }
-                                    onAllConfigured()
+                                    try {
+                                        session.setRepeatingRequest(request, null, mainHandler)
+                                    } catch (t: Throwable) {
+                                        onFailed(null)
+                                        return
+                                    }
+                                    sessions[cameraId] = session
+                                    step(i + 1)
+                                }
+
+                                override fun onConfigureFailed(session: CameraCaptureSession) {
+                                    if (token != sessionToken) return
+                                    onFailed(null)
                                 }
                             }
-
-                            override fun onConfigureFailed(session: CameraCaptureSession) {
-                                if (token != sessionToken || failed) return
-                                failed = true
-                                onFailed()
-                            }
-                        }
+                        )
                     )
-                )
-            } catch (t: Throwable) {
-                if (!failed) { failed = true; onFailed() }
-                return
+                } catch (t: Throwable) {
+                    onFailed(null)
+                }
             }
         }
+        step(0)
+    }
+
+    /** カメラが開いていればそのまま、無ければ開く。同じカメラの二重オープンは避ける。 */
+    @SuppressLint("MissingPermission")
+    private fun ensureOpen(id: String, multi: Boolean, callbackFn: (CameraDevice?, String?) -> Unit) {
+        devices[id]?.let {
+            callbackFn(it, null)
+            return
+        }
+        pendingOpens[id]?.let {
+            it += callbackFn
+            return
+        }
+        pendingOpens[id] = mutableListOf(callbackFn)
+
+        fun finish(camera: CameraDevice?, error: String?) {
+            pendingOpens.remove(id)?.forEach { it(camera, error) }
+        }
+
+        fun lost(message: String) {
+            if (pendingOpens.containsKey(id)) {
+                finish(null, message)
+            } else {
+                // 開いたあとに失われた（バックグラウンド化など）。録画中なら、ここまでを保存する。
+                if (activeRecording != null) stopRecording()
+                callback.onError(message, cameraDiagnostics())
+            }
+        }
+
+        try {
+            cameraManager.openCamera(
+                id,
+                object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        devices[id] = camera
+                        finish(camera, null)
+                    }
+
+                    override fun onDisconnected(camera: CameraDevice) {
+                        camera.close()
+                        devices.remove(id)
+                        sessions.remove(id)
+                        lost(context.getString(R.string.error_camera_disconnected))
+                    }
+
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        camera.close()
+                        devices.remove(id)
+                        sessions.remove(id)
+                        lost(
+                            if (multi) context.getString(R.string.error_multi_device, "$id:$error")
+                            else context.getString(R.string.error_camera_open, error)
+                        )
+                    }
+                },
+                mainHandler
+            )
+        } catch (t: Throwable) {
+            finish(null, context.getString(R.string.error_camera_open, -1))
+        }
+    }
+
+    private fun closeDevice(id: String) {
+        sessions.remove(id)?.let { runCatching { it.close() } }
+        devices.remove(id)?.let { runCatching { it.close() } }
     }
 
     // ── 録画 ───────────────────────────────────────────────────────────────
@@ -328,19 +424,26 @@ class MultiLensRecorder(
             return
         }
 
-        target.dir.mkdirs()
+        // 出力ファイルを SD / 本体の Movies/MultiCam に直接作り、そこへ録画する
+        val outputs = ArrayList<VideoOutput>()
         val entries = ArrayList<RecordingEntry>()
         try {
             lenses.forEachIndexed { index, lens ->
-                val finalFile = File(target.dir, "MultiCam_${timestamp}_${lens.fileTag}.mp4")
-                // 先頭レンズは音声付きで直接最終ファイルへ。他は映像のみの一時ファイル。
-                val recordFile = if (index == 0) finalFile
-                else File(target.dir, "MultiCam_${timestamp}_${lens.fileTag}_video.mp4")
-                val recorder = createRecorder(recordFile, profiles[index]!!, withAudio = index == 0)
-                entries += RecordingEntry(lens, recorder, recordFile, finalFile)
+                val output = MediaStoreVideoWriter.create(
+                    context, target.mediaStoreVolume, "MultiCam_${timestamp}_${lens.fileTag}.mp4"
+                )
+                outputs += output
+                val withAudio = when (settings.audio) {
+                    AudioPreference.ALL -> true
+                    AudioPreference.FIRST_ONLY -> index == 0
+                    AudioPreference.OFF -> false
+                }
+                entries += RecordingEntry(
+                    lens, createRecorder(output, profiles[index]!!, withAudio, relativeRotation(lens)), output
+                )
             }
         } catch (t: Throwable) {
-            entries.forEach { releaseRecorderOnly(it.recorder) }
+            discard(entries, outputs)
             callback.onError(context.getString(R.string.error_recorder_prepare, t.localizedMessage ?: ""), cameraDiagnostics())
             return
         }
@@ -353,7 +456,7 @@ class MultiLensRecorder(
         val token = ++sessionToken
         val surfaceById = entries.associate { it.lens.physicalId to it.recorder.surface }
 
-        configureSessions(
+        bringUp(
             lenses = lenses,
             template = CameraDevice.TEMPLATE_RECORD,
             surfaceFor = { surfaceById.getValue(it.physicalId) },
@@ -368,21 +471,22 @@ class MultiLensRecorder(
                     } + " @${settings.fps.value}fps"
                     callback.onRecordingStarted(summary)
                 } catch (t: Throwable) {
-                    entries.forEach { releaseRecorderOnly(it.recorder) }
-                    entries.forEach { it.recordFile.delete() }
+                    discard(entries, outputs)
                     runPreviewSession()
+                    val hint = if (settings.audio == AudioPreference.ALL && entries.size > 1) {
+                        "\n" + context.getString(R.string.hint_audio)
+                    } else ""
                     callback.onError(
-                        context.getString(R.string.error_record_start, t.localizedMessage ?: ""),
+                        context.getString(R.string.error_record_start, t.localizedMessage ?: "") + hint,
                         cameraDiagnostics()
                     )
                 }
             },
-            onFailed = {
-                entries.forEach { releaseRecorderOnly(it.recorder) }
-                entries.forEach { it.recordFile.delete() }
+            onFailed = { message ->
+                discard(entries, outputs)
                 runPreviewSession()
                 callback.onError(
-                    context.getString(
+                    message ?: context.getString(
                         if (neededCameraIds().size > 1) R.string.error_multi_device_rejected else R.string.error_record_rejected
                     ),
                     cameraDiagnostics()
@@ -391,59 +495,49 @@ class MultiLensRecorder(
         )
     }
 
+    /** 録画に失敗したとき、レコーダを解放し、作りかけの出力ファイルを削除する。 */
+    private fun discard(entries: List<RecordingEntry>, outputs: List<VideoOutput>) {
+        entries.forEach { releaseRecorderOnly(it.recorder) }
+        outputs.forEach { MediaStoreVideoWriter.finish(context, it, keep = false) }
+    }
+
     fun stopRecording() {
         val recording = activeRecording ?: return
+        activeRecording = null
         sessions.values.forEach {
             runCatching { it.stopRepeating() }
             runCatching { it.abortCaptures() }
         }
-        recording.entries.forEach { stopRecorder(it.recorder) }
 
+        // 長い動画では停止に時間がかかるので、画面を止めないよう別スレッドで行う
         runOnWorker {
-            val audioFile = recording.entries.first().finalFile
-            val toExport = ArrayList<File>()
-            val muxErrors = ArrayList<String>()
-
-            recording.entries.forEachIndexed { index, e ->
-                if (index == 0) {
-                    toExport += e.finalFile
-                    return@forEachIndexed
-                }
-                try {
-                    muxAudioIntoVideo(e.recordFile, audioFile, e.finalFile)
-                    e.recordFile.delete()
-                    toExport += e.finalFile
-                } catch (t: Throwable) {
-                    muxErrors += "${e.lens.label}: ${t.localizedMessage}"
-                    e.finalFile.delete()
-                    toExport += e.recordFile          // 音声なしで保存
-                }
+            val saved = ArrayList<String>()
+            recording.entries.forEach { e ->
+                val valid = stopRecorder(e.recorder)
+                if (MediaStoreVideoWriter.finish(context, e.output, keep = valid)) saved += e.output.publicPath
             }
-
-            activeRecording = null
             runOnMain { runPreviewSession() }
 
-            val exported = MediaStoreVideoExporter.export(context, toExport, recording.target.mediaStoreVolume)
-            exported.forEach { (source, _) -> source.delete() }   // 公開できたものは重複を残さない
-
-            val exportedSources = exported.map { it.first }.toSet()
-            val paths = exported.map { it.second } +
-                toExport.filter { it !in exportedSources }.map { it.absolutePath }
+            val total = recording.entries.size
             val message = when {
-                exported.size == toExport.size && muxErrors.isEmpty() ->
-                    context.getString(R.string.saved_to, recording.target.label)
-                exported.size == toExport.size ->
-                    context.getString(R.string.saved_audio_mux_failed, muxErrors.joinToString())
-                exported.isNotEmpty() -> context.getString(R.string.saved_partial)
-                else -> context.getString(R.string.saved_app_only)
+                saved.size == total -> context.getString(R.string.saved_to, recording.target.label)
+                saved.isNotEmpty() -> context.getString(R.string.saved_partial)
+                else -> context.getString(R.string.error_save_failed)
             }
-            callback.onRecordingFinished(paths, message)
+            callback.onRecordingFinished(saved, message)
         }
     }
 
     fun release() {
-        runCatching { activeRecording?.entries?.forEach { stopRecorder(it.recorder) } }
-        activeRecording = null
+        displayListener?.let { runCatching { context.getSystemService(DisplayManager::class.java).unregisterDisplayListener(it) } }
+        displayListener = null
+        activeRecording?.let { rec ->
+            activeRecording = null
+            rec.entries.forEach { e ->
+                val valid = stopRecorder(e.recorder)
+                MediaStoreVideoWriter.finish(context, e.output, keep = valid)
+            }
+        }
         sessions.values.forEach { runCatching { it.close() } }
         devices.values.forEach { runCatching { it.close() } }
         sessions.clear()
@@ -480,7 +574,9 @@ class MultiLensRecorder(
             ?: ranges.filter { it.upper == fps }.maxByOrNull { it.lower }
     }
 
-    private fun createRecorder(file: File, profile: VideoProfile, withAudio: Boolean): MediaRecorder {
+    private fun createRecorder(
+        output: VideoOutput, profile: VideoProfile, withAudio: Boolean, orientationHint: Int
+    ): MediaRecorder {
         val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             MediaRecorder(context)
         } else {
@@ -491,7 +587,8 @@ class MultiLensRecorder(
             if (withAudio) recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
             recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            recorder.setOutputFile(file.absolutePath)
+            recorder.setOutputFile(output.pfd.fileDescriptor)
+            recorder.setOrientationHint(orientationHint)   // 録画開始時の向きで、再生時に正立させる
             recorder.setVideoEncodingBitRate(profile.bitRate)
             recorder.setVideoFrameRate(profile.fps)
             recorder.setVideoSize(profile.size.width, profile.size.height)
@@ -509,10 +606,12 @@ class MultiLensRecorder(
         return recorder
     }
 
-    private fun stopRecorder(recorder: MediaRecorder) {
-        runCatching { recorder.stop() }
+    /** 停止して解放する。停止に成功（有効な動画が書けた）なら true。 */
+    private fun stopRecorder(recorder: MediaRecorder): Boolean {
+        val ok = runCatching { recorder.stop() }.isSuccess
         runCatching { recorder.reset() }
         runCatching { recorder.release() }
+        return ok
     }
 
     private fun releaseRecorderOnly(recorder: MediaRecorder) {
@@ -528,55 +627,6 @@ class MultiLensRecorder(
             pixels >= 1920L * 1080L -> 28_000_000
             pixels >= 1280L * 720L -> 14_000_000
             else -> 8_000_000
-        }
-    }
-
-    // ── 音声の複製（mux） ───────────────────────────────────────────────────
-
-    private fun muxAudioIntoVideo(videoOnlyFile: File, audioSourceFile: File, outputFile: File) {
-        val videoExtractor = MediaExtractor()
-        val audioExtractor = MediaExtractor()
-        val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        var started = false
-        try {
-            videoExtractor.setDataSource(videoOnlyFile.absolutePath)
-            audioExtractor.setDataSource(audioSourceFile.absolutePath)
-
-            val tracks = mutableListOf<Pair<MediaExtractor, Int>>()
-            for (i in 0 until videoExtractor.trackCount) {
-                val format = videoExtractor.getTrackFormat(i)
-                if (format.getString(MediaFormat.KEY_MIME).orEmpty().startsWith("video/")) {
-                    tracks += videoExtractor to muxer.addTrack(format)
-                    videoExtractor.selectTrack(i)
-                }
-            }
-            for (i in 0 until audioExtractor.trackCount) {
-                val format = audioExtractor.getTrackFormat(i)
-                if (format.getString(MediaFormat.KEY_MIME).orEmpty().startsWith("audio/")) {
-                    tracks += audioExtractor to muxer.addTrack(format)
-                    audioExtractor.selectTrack(i)
-                }
-            }
-            muxer.start()
-            started = true
-            tracks.forEach { (extractor, track) -> copySelectedTrack(extractor, muxer, track) }
-        } finally {
-            if (started) runCatching { muxer.stop() }
-            runCatching { muxer.release() }
-            videoExtractor.release()
-            audioExtractor.release()
-        }
-    }
-
-    private fun copySelectedTrack(extractor: MediaExtractor, muxer: MediaMuxer, track: Int) {
-        val buffer = ByteBuffer.allocate(2 * 1024 * 1024)
-        val info = MediaCodec.BufferInfo()
-        while (true) {
-            val size = extractor.readSampleData(buffer, 0)
-            if (size < 0) break
-            info.set(0, size, extractor.sampleTime, extractor.sampleFlags)
-            muxer.writeSampleData(track, buffer, info)
-            extractor.advance()
         }
     }
 
@@ -615,8 +665,7 @@ private data class VideoProfile(val size: Size, val fps: Int, val bitRate: Int, 
 private class RecordingEntry(
     val lens: LensInfo,
     val recorder: MediaRecorder,
-    val recordFile: File,     // 実際に録画するファイル
-    val finalFile: File       // 最終的なファイル（先頭レンズは recordFile と同じ）
+    val output: VideoOutput
 )
 
 private class ActiveRecording(val target: SaveTarget, val entries: List<RecordingEntry>)

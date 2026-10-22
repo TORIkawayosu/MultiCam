@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -24,6 +25,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -107,12 +109,20 @@ class MainActivity : ComponentActivity() {
                     },
                     onRecordToggle = { if (uiState.isRecording) stopRecording() else startRecording() },
                     onToggleLens = ::toggleLens,
-                    onPresetUltraTele = { selectLenses(ultraTeleSelection(plan?.lenses.orEmpty())) },
+                    onPresetUltraTele = {
+                        // ボタンは明示的な操作なので、別カメラ同士でもそのまま選ぶ（開けない端末ではエラー表示）
+                        val l = plan?.lenses.orEmpty()
+                        val u = l.firstOrNull { it.type == LensType.ULTRA_WIDE }
+                        val t = l.lastOrNull { it.type == LensType.TELE }
+                        if (u != null && t != null) selectLenses(setOf(u.physicalId, t.physicalId))
+                    },
                     onPresetAll = { selectLenses(plan?.lenses.orEmpty().map { it.physicalId }.toSet()) },
                     onFpsChanged = { uiState = uiState.copy(videoSettings = uiState.videoSettings.copy(fps = it)) },
+                    onAudioChanged = { uiState = uiState.copy(videoSettings = uiState.videoSettings.copy(audio = it)) },
                     onQualityChanged = { id, q ->
                         val s = uiState.videoSettings
                         uiState = uiState.copy(videoSettings = s.copy(qualities = s.qualities + (id to q)))
+                        scheduleRefresh()   // 画質が変わると録画の縦横比も変わるので、プレビューを合わせ直す
                     },
                     onStorageChanged = ::changeStorage,
                     onToggleDiagnostics = {
@@ -172,22 +182,22 @@ class MainActivity : ComponentActivity() {
         val selected = saved.ifEmpty { ultraTeleSelection(detected.lenses) }
 
         if (recorder == null) recorder = MultiLensRecorder(this, recorderCallback)
-        val noTele = detected.lenses.none { it.type == LensType.TELE }
-        uiState = uiState.copy(
-            lenses = detected.lenses,
-            selectedIds = selected,
-            error = if (noTele) getString(R.string.error_no_tele) else null,
-            diagnostics = if (noTele) runCatching { LensDetector.diagnostics(this) }.getOrNull() else null
-        )
+        uiState = uiState.copy(lenses = detected.lenses, selectedIds = selected, error = null)
         scheduleRefresh()
     }
 
-    /** 超広角＋望遠。どちらかが無ければ、画角の両端の2本（1本なら その1本）。 */
+    /**
+     * 超広角＋望遠。ただし2本が別々のカメラIDだと同時に開けない端末が多いので、
+     * その場合は広角（なければ先頭）の1本だけを初期選択にする。
+     */
     private fun ultraTeleSelection(lenses: List<LensInfo>): Set<String> {
         val ultra = lenses.firstOrNull { it.type == LensType.ULTRA_WIDE }
         val tele = lenses.lastOrNull { it.type == LensType.TELE }
-        return if (ultra != null && tele != null) setOf(ultra.physicalId, tele.physicalId)
-        else listOfNotNull(lenses.firstOrNull(), lenses.lastOrNull()).map { it.physicalId }.toSet()
+        val pair = if (ultra != null && tele != null) listOf(ultra, tele)
+        else listOfNotNull(lenses.firstOrNull(), lenses.lastOrNull()).distinct()
+        if (pair.map { it.cameraId }.distinct().size <= 1) return pair.map { it.physicalId }.toSet()
+        val single = lenses.firstOrNull { it.type == LensType.WIDE } ?: lenses.first()
+        return setOf(single.physicalId)
     }
 
     // ── レンズ選択 ──────────────────────────────────────────────────────────
@@ -218,7 +228,7 @@ class MainActivity : ComponentActivity() {
         val selected = p.lenses.filter { it.physicalId in uiState.selectedIds }
         if (selected.isEmpty() || selected.any { previewContainers[it.physicalId] == null }) return
         uiState = uiState.copy(isCameraReady = false, status = getString(R.string.status_preparing))
-        rec.startPreview(p, selected, previewContainers.toMap())
+        rec.startPreview(selected, previewContainers.toMap(), uiState.videoSettings)
     }
 
     // ── 保存先 ──────────────────────────────────────────────────────────────
@@ -281,6 +291,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onError(message: String, diagnostics: String) = runOnUiThread {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             uiState = uiState.copy(
                 isCameraReady = false,
                 isRecording = false,
@@ -290,6 +301,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onRecordingStarted(summary: String) = runOnUiThread {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)   // 録画中は画面を消さない
             uiState = uiState.copy(
                 isRecording = true,
                 status = getString(R.string.status_recording, summary),
@@ -299,6 +311,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onRecordingFinished(files: List<String>, message: String) = runOnUiThread {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             uiState = uiState.copy(isRecording = false, status = message, error = null, lastFiles = files)
             refreshStorage()
         }
@@ -343,6 +356,7 @@ private fun MultiCamScreen(
     onPresetUltraTele: () -> Unit,
     onPresetAll: () -> Unit,
     onFpsChanged: (FpsPreference) -> Unit,
+    onAudioChanged: (AudioPreference) -> Unit,
     onQualityChanged: (String, QualityPreference) -> Unit,
     onStorageChanged: (StorageChoice) -> Unit,
     onToggleDiagnostics: () -> Unit
@@ -366,33 +380,64 @@ private fun MultiCamScreen(
     }
 
     Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF111315)) {
-        Box(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Brush.verticalGradient(listOf(Color(0xFF171A1E), Color(0xFF0C0D0F))))
+                .displayCutoutPadding()
                 .statusBarsPadding()
                 .navigationBarsPadding()
                 .padding(16.dp)
         ) {
-            Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Header(state)
-                PreviewLayout(
-                    state = state,
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    onPreviewReady = onPreviewReady,
-                    onPreviewRelease = onPreviewRelease
-                )
-                SettingsPanel(
-                    state = state,
-                    onToggleLens = onToggleLens,
-                    onPresetUltraTele = onPresetUltraTele,
-                    onPresetAll = onPresetAll,
-                    onFpsChanged = onFpsChanged,
-                    onQualityChanged = onQualityChanged,
-                    onStorageChanged = onStorageChanged,
-                    onToggleDiagnostics = onToggleDiagnostics
-                )
-                ControlDock(state = state, onRecordToggle = onRecordToggle)
+            val landscape = maxWidth > maxHeight
+
+            @Composable
+            fun settingsPanel(compact: Boolean) = SettingsPanel(
+                state = state,
+                compact = compact,
+                onToggleLens = onToggleLens,
+                onPresetUltraTele = onPresetUltraTele,
+                onPresetAll = onPresetAll,
+                onFpsChanged = onFpsChanged,
+                onAudioChanged = onAudioChanged,
+                onQualityChanged = onQualityChanged,
+                onStorageChanged = onStorageChanged,
+                onToggleDiagnostics = onToggleDiagnostics
+            )
+
+            if (landscape) {
+                // 横画面: 左にプレビュー、右に操作パネル（スクロール可）
+                Row(modifier = Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    PreviewLayout(
+                        state = state,
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        onPreviewReady = onPreviewReady,
+                        onPreviewRelease = onPreviewRelease
+                    )
+                    Column(
+                        modifier = Modifier
+                            .width(340.dp)
+                            .fillMaxHeight()
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Header(state)
+                        settingsPanel(compact = false)
+                        ControlDock(state = state, onRecordToggle = onRecordToggle)
+                    }
+                }
+            } else {
+                Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Header(state)
+                    PreviewLayout(
+                        state = state,
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        onPreviewReady = onPreviewReady,
+                        onPreviewRelease = onPreviewRelease
+                    )
+                    settingsPanel(compact = true)
+                    ControlDock(state = state, onRecordToggle = onRecordToggle)
+                }
             }
         }
     }
@@ -555,10 +600,12 @@ private fun PreviewTile(
 @Composable
 private fun SettingsPanel(
     state: MultiCamUiState,
+    compact: Boolean,
     onToggleLens: (String) -> Unit,
     onPresetUltraTele: () -> Unit,
     onPresetAll: () -> Unit,
     onFpsChanged: (FpsPreference) -> Unit,
+    onAudioChanged: (AudioPreference) -> Unit,
     onQualityChanged: (String, QualityPreference) -> Unit,
     onStorageChanged: (StorageChoice) -> Unit,
     onToggleDiagnostics: () -> Unit
@@ -574,9 +621,7 @@ private fun SettingsPanel(
         border = BorderStroke(1.dp, Color(0xFF2C343A))
     ) {
         Column(
-            modifier = Modifier
-                .heightIn(max = 230.dp)
-                .verticalScroll(rememberScrollState())
+            modifier = (if (compact) Modifier.heightIn(max = 230.dp).verticalScroll(rememberScrollState()) else Modifier)
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
@@ -645,6 +690,22 @@ private fun SettingsPanel(
                         accent = Color(0xFF69C8FF),
                         enabled = enabled
                     ) { onFpsChanged(f) }
+                }
+            }
+
+            // 音声
+            SectionTitle(stringResource(R.string.audio_title))
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                AudioPreference.entries.forEach { a ->
+                    Chip(
+                        text = stringResource(a.labelRes),
+                        active = a == state.videoSettings.audio,
+                        accent = Color(0xFF8EE7B5),
+                        enabled = enabled
+                    ) { onAudioChanged(a) }
                 }
             }
 
