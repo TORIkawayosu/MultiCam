@@ -1,4 +1,3 @@
-# 📷 MultiCam（マルチレンズ版・日本語）
 
 Android の背面レンズを **好きな組み合わせで同時録画** するアプリです。レンズごとに別々のMP4ファイルで保存します。
 元プロジェクト [RuggeroCadamuroITA/MultiCam](https://github.com/RuggeroCadamuroITA/MultiCam)（MIT）をフォークして改造したものです。
